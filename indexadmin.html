@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>SaveMe Admin Panel</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: sans-serif; background: #f4f7f6; padding: 20px; }
+        .card { background: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        input, textarea { width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; }
+        button { background: #0088cc; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; }
+        .stats { font-size: 20px; font-weight: bold; color: #0088cc; }
+    </style>
+</head>
+<body>
+    <h2>🤖 SaveMe Admin Panel</h2>
+    
+    <div class="card">
+        <h3>📊 Daily Stats</h3>
+        <p>Today's Active Users: <span class="stats" id="userCount">0</span></p>
+    </div>
+
+    <div class="card">
+        <h3>📝 Set Welcome Message</h3>
+        <input type="text" id="imgUrl" placeholder="Image URL">
+        <textarea id="welcomeMsg" rows="4" placeholder="Welcome Message Text"></textarea>
+        <button onclick="saveSettings()">Save Settings</button>
+    </div>
+
+    <div class="card">
+        <h3>📢 Add Mandatory Channel</h3>
+        <input type="text" id="chName" placeholder="Channel Name">
+        <input type="text" id="chUser" placeholder="@Username or Link">
+        <button onclick="addChannel()">Add Channel</button>
+        <div id="channelList"></div>
+    </div>
+
+    <script>
+        const API = ""; // Same domain
+
+        async function loadData() {
+            const res = await fetch('/api/admin/data');
+            const data = await res.json();
+            document.getElementById('userCount').innerText = data.dailyUsers || 0;
+            document.getElementById('welcomeMsg').value = data.welcomeText || "";
+            document.getElementById('imgUrl').value = data.welcomeImage || "";
+            
+            let html = '<h4>Channels:</h4>';
+            (data.channels || []).forEach((c, i) => {
+                html += `<p>${c.name} (${c.user}) <button onclick="delChannel(${i})" style="background:red; padding:2px 5px;">X</button></p>`;
+            });
+            document.getElementById('channelList').innerHTML = html;
+        }
+
+        async function saveSettings() {
+            const text = document.getElementById('welcomeMsg').value;
+            const img = document.getElementById('imgUrl').value;
+            await fetch('/api/admin/settings', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({text, img})
+            });
+            alert("Saved!");
+        }
+
+        async function addChannel() {
+            const name = document.getElementById('chName').value;
+            const user = document.getElementById('chUser').value;
+            await fetch('/api/admin/add-channel', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({name, user})
+            });
+            loadData();
+        }
+
+        async function delChannel(index) {
+            await fetch('/api/admin/del-channel', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({index})
+            });
+            loadData();
+        }
+
+        loadData();
+    </script>
+</body>
+</html>
