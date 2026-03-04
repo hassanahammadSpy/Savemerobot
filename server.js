@@ -1,17 +1,20 @@
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
-const cors = require('cors');
 const admin = require('firebase-admin');
+const path = require('path');
+const bodyParser = require('body-parser');
+const cors = require('cors');
 
 const app = express();
 app.use(cors());
+app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_ID = 7767338426;
+const ADMIN_ID = 7767338426; // আপনার আইডি
 
-// Firebase Initialization
+// --- Firebase Initialization ---
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
@@ -20,27 +23,94 @@ admin.initializeApp({
 const db = admin.database();
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-const userRequests = {};
-const adminState = {};
+const userSessions = {}; // সাময়িকভাবে লিঙ্ক জমা রাখার জন্য
 
-// API Function
-async function fetchVideoData(videoUrl) {
-    try {
-        const apiUrl = `https://r-gengpt-api.vercel.app/api/video/download?url=${encodeURIComponent(videoUrl)}`;
-        const response = await axios.get(apiUrl);
-        return response.data;
-    } catch (error) { return null; }
+// --- Admin Panel API Routes ---
+
+// অ্যাডমিন প্যানেলের জন্য ডেটা রিড করা
+app.get('/api/admin/data', async (req, res) => {
+    const today = new Date().toISOString().split('T')[0];
+    const adminSnap = await db.ref('admin_settings').once('value');
+    const statsSnap = await db.ref(`daily_stats/${today}`).once('value');
+    
+    const settings = adminSnap.val() || {};
+    settings.dailyUsers = statsSnap.numChildren() || 0;
+    res.json(settings);
+});
+
+// ওয়েলকাম মেসেজ ও ইমেজ আপডেট
+app.post('/api/admin/settings', async (req, res) => {
+    const { text, img } = req.body;
+    await db.ref('admin_settings').update({ welcomeText: text, welcomeImage: img });
+    res.json({ success: true });
+});
+
+// মাস্ট জয়েন চ্যানেল অ্যাড করা
+app.post('/api/admin/add-channel', async (req, res) => {
+    const { name, user } = req.body;
+    const snap = await db.ref('admin_settings/channels').once('value');
+    let channels = snap.val() || [];
+    channels.push({ name, user });
+    await db.ref('admin_settings/channels').set(channels);
+    res.json({ success: true });
+});
+
+// চ্যানেল রিমুভ করা
+app.post('/api/admin/del-channel', async (req, res) => {
+    const { index } = req.body;
+    const snap = await db.ref('admin_settings/channels').once('value');
+    let channels = snap.val() || [];
+    channels.splice(index, 1);
+    await db.ref('admin_settings/channels').set(channels);
+    res.json({ success: true });
+});
+
+// ব্রডকাস্ট পাঠানো
+app.post('/api/admin/broadcast', async (req, res) => {
+    const { img, text, btnText, btnUrl } = req.body;
+    const userSnap = await db.ref('all_users').once('value');
+    const users = userSnap.val() || {};
+    const userIds = Object.keys(users);
+    
+    let count = 0;
+    const opts = { parse_mode: 'Markdown' };
+    if (btnText && btnUrl) {
+        opts.reply_markup = { inline_keyboard: [[{ text: btnText, url: btnUrl }]] };
+    }
+
+    for (const id of userIds) {
+        try {
+            if (img && img.trim() !== "") {
+                await bot.sendPhoto(id, img, { caption: text, ...opts });
+            } else {
+                await bot.sendMessage(id, text, opts);
+            }
+            count++;
+        } catch (e) {}
+    }
+    res.json({ count });
+});
+
+// --- Bot Logic ---
+
+// ইউজার ও স্ট্যাটাস ট্র্যাক করা
+async function trackUser(chatId) {
+    const today = new Date().toISOString().split('T')[0];
+    await db.ref(`all_users/${chatId}`).set(true);
+    await db.ref(`daily_stats/${today}/${chatId}`).set(true);
 }
 
-// Force Join Check
-async function isSubscribed(userId) {
-    const snapshot = await db.ref('channels').once('value');
-    const channels = snapshot.val() || [];
+// জয়েন চেক করা
+async function checkJoin(userId) {
+    const snap = await db.ref('admin_settings/channels').once('value');
+    const channels = snap.val() || [];
     if (channels.length === 0) return true;
 
-    for (const channel of channels) {
+    for (const ch of channels) {
         try {
-            const res = await bot.getChatMember(channel, userId);
+            // ইউজারনেম বের করা (লিঙ্ক থেকে বা সরাসরি @username)
+            let username = ch.user.includes('t.me/') ? `@${ch.user.split('/').pop()}` : ch.user;
+            const res = await bot.getChatMember(username, userId);
             if (['left', 'kicked'].includes(res.status)) return false;
         } catch (e) { return false; }
     }
@@ -50,94 +120,86 @@ async function isSubscribed(userId) {
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text;
+    if (!text) return;
 
-    // Save User to Firebase
-    db.ref(`users/${chatId}`).set(true);
+    await trackUser(chatId);
 
-    if (text === '/adminpanel' && chatId === ADMIN_ID) {
-        const userSnap = await db.ref('users').once('value');
-        const statsSnap = await db.ref('totalDownloads').once('value');
-        const chanSnap = await db.ref('channels').once('value');
+    // /start কমান্ড
+    if (text === '/start') {
+        const snap = await db.ref('admin_settings').once('value');
+        const data = snap.val() || {};
+        const welcomeMsg = data.welcomeText || "Welcome!";
+        const welcomeImg = data.welcomeImage || "https://telegra.ph/file/default.jpg";
 
-        const totalUsers = userSnap.numChildren() || 0;
-        const totalDl = statsSnap.val() || 0;
-        const channels = chanSnap.val() || [];
-
-        const statsMsg = `🛠 **Admin Panel**\n\n👥 Users: ${totalUsers}\n📥 Downloads: ${totalDl}\n📢 Channels: ${channels.join(', ')}`;
-        bot.sendMessage(chatId, statsMsg, {
+        const opts = {
+            caption: welcomeMsg,
             reply_markup: {
                 inline_keyboard: [
-                    [{ text: "➕ Add Channel", callback_data: 'add_ch' }, { text: "❌ Remove Channel", callback_data: 'rem_ch' }]
+                    [
+                        { text: "📢 Join Channel", url: "https://t.me/+GyFgfeJIub81MDg9" },
+                        { text: "👥 Join Group", url: "https://t.me/+V8XTiO_Vo8tlOGZl" }
+                    ],
+                    [{ text: "➕ Add Bot to Group", url: "https://t.me/SavedMe_Robot?startgroup=true" }]
                 ]
             }
-        });
-        return;
+        };
+        return bot.sendPhoto(chatId, welcomeImg, opts);
     }
 
-    // Admin Input Handlers
-    if (adminState[chatId] === 'add') {
-        const snap = await db.ref('channels').once('value');
-        let channels = snap.val() || [];
-        channels.push(text);
-        await db.ref('channels').set(channels);
-        adminState[chatId] = null;
-        return bot.sendMessage(chatId, "✅ Added!");
-    }
-
-    if (adminState[chatId] === 'rem') {
-        const snap = await db.ref('channels').once('value');
-        let channels = snap.val() || [];
-        channels = channels.filter(c => c !== text);
-        await db.ref('channels').set(channels);
-        adminState[chatId] = null;
-        return bot.sendMessage(chatId, "✅ Removed!");
-    }
-
-    if (text && text.startsWith('http')) {
-        const subscribed = await isSubscribed(chatId);
-        if (!subscribed) {
-            const snap = await db.ref('channels').once('value');
+    // ভিডিও লিঙ্ক হ্যান্ডলিং
+    if (text.startsWith('http')) {
+        const joined = await checkJoin(chatId);
+        if (!joined) {
+            userSessions[chatId] = text;
+            const snap = await db.ref('admin_settings/channels').once('value');
             const channels = snap.val() || [];
-            const links = channels.map(c => `👉 [Join](https://t.me/${c.replace('@','')})`).join('\n');
-            return bot.sendMessage(chatId, `⚠️ Join first:\n${links}`, { parse_mode: 'Markdown' });
+            
+            const buttons = channels.map(c => [{ text: `📢 ${c.name}`, url: c.user.startsWith('http') ? c.user : `https://t.me/${c.user.replace('@','')}` }]);
+            buttons.push([{ text: "✅ Verify", callback_data: "verify_join" }]);
+
+            return bot.sendMessage(chatId, "⚠️ **You must join our channels to use this bot!**", {
+                parse_mode: 'Markdown',
+                reply_markup: { inline_keyboard: buttons }
+            });
         }
-
-        try { await bot.setMessageReaction(chatId, msg.message_id, { reaction: [{ type: 'emoji', emoji: '👀' }] }); } catch(e){}
-
-        userRequests[chatId] = text;
-        bot.sendMessage(chatId, "Select format:", {
-            reply_markup: {
-                inline_keyboard: [[{ text: "🎥 Video", callback_data: 'v' }, { text: "🎵 Audio", callback_data: 'a' }]]
-            }
-        });
+        processDownload(chatId, text);
     }
 });
 
 bot.on('callback_query', async (q) => {
     const chatId = q.message.chat.id;
-    if (q.data === 'add_ch') { adminState[chatId] = 'add'; return bot.sendMessage(chatId, "Send @username:"); }
-    if (q.data === 'rem_ch') { adminState[chatId] = 'rem'; return bot.sendMessage(chatId, "Send @username to remove:"); }
-
-    const url = userRequests[chatId];
-    if (!url) return;
-
-    bot.answerCallbackQuery(q.id, { text: "📥 Fetching..." });
-    const res = await fetchVideoData(url);
-    if (res && res.data && res.data.medias) {
-        const file = q.data === 'v' ? res.data.medias.find(m => m.type === 'video') : res.data.medias.find(m => m.extension === 'mp3');
-        if (file) {
-            if (q.data === 'v') await bot.sendVideo(chatId, file.url);
-            else await bot.sendAudio(chatId, file.url);
-            
-            // Increment Download Count in Firebase
-            db.ref('totalDownloads').transaction(c => (c || 0) + 1);
+    if (q.data === "verify_join") {
+        const joined = await checkJoin(chatId);
+        if (joined) {
+            await bot.deleteMessage(chatId, q.message.message_id);
+            const link = userSessions[chatId];
+            if (link) processDownload(chatId, link);
+        } else {
+            bot.answerCallbackQuery(q.id, { text: "❌ You haven't joined yet!", show_alert: true });
         }
     }
 });
 
-app.get('/api/download', async (req, res) => {
-    const data = await fetchVideoData(req.query.url);
-    res.json(data);
+async function processDownload(chatId, url) {
+    const waitMsg = await bot.sendMessage(chatId, "⏳");
+    try {
+        const res = await axios.get(`https://r-gengpt-api.vercel.app/api/video/download?url=${encodeURIComponent(url)}`);
+        const data = res.data.data;
+        if (data && data.medias) {
+            const video = data.medias.find(m => m.type === 'video') || data.medias[0];
+            await bot.sendVideo(chatId, video.url, { caption: data.title });
+            await bot.deleteMessage(chatId, waitMsg.message_id);
+        } else {
+            bot.editMessageText("❌ Video not found.", { chat_id: chatId, message_id: waitMsg.message_id });
+        }
+    } catch (e) {
+        bot.editMessageText("❌ API Error.", { chat_id: chatId, message_id: waitMsg.message_id });
+    }
+}
+
+// অ্যাডমিন প্যানেল ফাইল সার্ভ করা (Render-এ indexadmin.html সরাসরি রুট ফোল্ডারে থাকলে)
+app.get('/admin', (req, res) => {
+    res.sendFile(path.join(__dirname, 'indexadmin.html'));
 });
 
-app.listen(PORT, () => console.log("Server Live"));
+app.listen(PORT, () => console.log(`Server started on ${PORT}`));
