@@ -12,7 +12,7 @@ app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_ID = 7767338426; // আপনার আইডি
+const ADMIN_ID = 7767338426;
 
 // --- Firebase Initialization ---
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
@@ -23,29 +23,33 @@ admin.initializeApp({
 const db = admin.database();
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-const userSessions = {}; // সাময়িকভাবে লিঙ্ক জমা রাখার জন্য
+const userSessions = {}; 
+
+const chatBoxConfig = {
+    reply_markup: {
+        keyboard: [[{ text: "🤖 SavedMe Robot" }]],
+        resize_keyboard: true,
+        input_field_placeholder: "Send me links"
+    }
+};
 
 // --- Admin Panel API Routes ---
 
-// অ্যাডমিন প্যানেলের জন্য ডেটা রিড করা
 app.get('/api/admin/data', async (req, res) => {
     const today = new Date().toISOString().split('T')[0];
     const adminSnap = await db.ref('admin_settings').once('value');
     const statsSnap = await db.ref(`daily_stats/${today}`).once('value');
-    
     const settings = adminSnap.val() || {};
     settings.dailyUsers = statsSnap.numChildren() || 0;
     res.json(settings);
 });
 
-// ওয়েলকাম মেসেজ ও ইমেজ আপডেট
 app.post('/api/admin/settings', async (req, res) => {
     const { text, img } = req.body;
     await db.ref('admin_settings').update({ welcomeText: text, welcomeImage: img });
     res.json({ success: true });
 });
 
-// মাস্ট জয়েন চ্যানেল অ্যাড করা
 app.post('/api/admin/add-channel', async (req, res) => {
     const { name, user } = req.body;
     const snap = await db.ref('admin_settings/channels').once('value');
@@ -55,7 +59,6 @@ app.post('/api/admin/add-channel', async (req, res) => {
     res.json({ success: true });
 });
 
-// চ্যানেল রিমুভ করা
 app.post('/api/admin/del-channel', async (req, res) => {
     const { index } = req.body;
     const snap = await db.ref('admin_settings/channels').once('value');
@@ -65,7 +68,6 @@ app.post('/api/admin/del-channel', async (req, res) => {
     res.json({ success: true });
 });
 
-// ব্রডকাস্ট পাঠানো
 app.post('/api/admin/broadcast', async (req, res) => {
     const { img, text, btnText, btnUrl } = req.body;
     const userSnap = await db.ref('all_users').once('value');
@@ -93,28 +95,31 @@ app.post('/api/admin/broadcast', async (req, res) => {
 
 // --- Bot Logic ---
 
-// ইউজার ও স্ট্যাটাস ট্র্যাক করা
 async function trackUser(chatId) {
     const today = new Date().toISOString().split('T')[0];
     await db.ref(`all_users/${chatId}`).set(true);
     await db.ref(`daily_stats/${today}/${chatId}`).set(true);
 }
 
-// জয়েন চেক করা
-async function checkJoin(userId) {
+// এই ফাংশনটি এখন চেক করবে ইউজার কোন কোন চ্যানেলে জয়েন নেই
+async function getMissingChannels(userId) {
     const snap = await db.ref('admin_settings/channels').once('value');
-    const channels = snap.val() || [];
-    if (channels.length === 0) return true;
+    const allChannels = snap.val() || [];
+    if (allChannels.length === 0) return [];
 
-    for (const ch of channels) {
+    let missing = [];
+    for (const ch of allChannels) {
         try {
-            // ইউজারনেম বের করা (লিঙ্ক থেকে বা সরাসরি @username)
             let username = ch.user.includes('t.me/') ? `@${ch.user.split('/').pop()}` : ch.user;
             const res = await bot.getChatMember(username, userId);
-            if (['left', 'kicked'].includes(res.status)) return false;
-        } catch (e) { return false; }
+            if (['left', 'kicked'].includes(res.status)) {
+                missing.push(ch);
+            }
+        } catch (e) {
+            missing.push(ch); // এরর হলেও জয়েন করতে বলবে (নিরাপত্তার জন্য)
+        }
     }
-    return true;
+    return missing;
 }
 
 bot.on('message', async (msg) => {
@@ -124,7 +129,6 @@ bot.on('message', async (msg) => {
 
     await trackUser(chatId);
 
-    // /start কমান্ড
     if (text === '/start') {
         const snap = await db.ref('admin_settings').once('value');
         const data = snap.val() || {};
@@ -140,21 +144,27 @@ bot.on('message', async (msg) => {
                         { text: "👥 Join Group", url: "https://t.me/+V8XTiO_Vo8tlOGZl" }
                     ],
                     [{ text: "➕ Add Bot to Group", url: "https://t.me/SavedMe_Robot?startgroup=true" }]
-                ]
+                ],
+                keyboard: [[{ text: "🤖 SavedMe Robot" }]],
+                resize_keyboard: true,
+                input_field_placeholder: "Send me links"
             }
         };
         return bot.sendPhoto(chatId, welcomeImg, opts);
     }
 
-    // ভিডিও লিঙ্ক হ্যান্ডলিং
     if (text.startsWith('http')) {
-        const joined = await checkJoin(chatId);
-        if (!joined) {
+        const missingChannels = await getMissingChannels(chatId);
+        
+        if (missingChannels.length > 0) {
             userSessions[chatId] = text;
-            const snap = await db.ref('admin_settings/channels').once('value');
-            const channels = snap.val() || [];
             
-            const buttons = channels.map(c => [{ text: `📢 ${c.name}`, url: c.user.startsWith('http') ? c.user : `https://t.me/${c.user.replace('@','')}` }]);
+            // শুধুমাত্র মিসিং চ্যানেলগুলো বাটন হিসেবে তৈরি করা
+            const buttons = missingChannels.map(c => [{ 
+                text: `📢 ${c.name}`, 
+                url: c.user.startsWith('http') ? c.user : `https://t.me/${c.user.replace('@','')}` 
+            }]);
+            
             buttons.push([{ text: "✅ Verify", callback_data: "verify_join" }]);
 
             return bot.sendMessage(chatId, "⚠️ **You must join our channels to use this bot!**", {
@@ -169,25 +179,39 @@ bot.on('message', async (msg) => {
 bot.on('callback_query', async (q) => {
     const chatId = q.message.chat.id;
     if (q.data === "verify_join") {
-        const joined = await checkJoin(chatId);
-        if (joined) {
+        const missingChannels = await getMissingChannels(chatId);
+        
+        if (missingChannels.length === 0) {
             await bot.deleteMessage(chatId, q.message.message_id);
             const link = userSessions[chatId];
             if (link) processDownload(chatId, link);
         } else {
-            bot.answerCallbackQuery(q.id, { text: "❌ You haven't joined yet!", show_alert: true });
+            // যদি এখনো কিছু মিসিং থাকে, তবে বাটন আপডেট করে মেসেজ দিবে
+            const buttons = missingChannels.map(c => [{ 
+                text: `📢 ${c.name}`, 
+                url: c.user.startsWith('http') ? c.user : `https://t.me/${c.user.replace('@','')}` 
+            }]);
+            buttons.push([{ text: "✅ Verify", callback_data: "verify_join" }]);
+
+            bot.editMessageReplyMarkup({ inline_keyboard: buttons }, { 
+                chat_id: chatId, 
+                message_id: q.message.message_id 
+            });
+            
+            bot.answerCallbackQuery(q.id, { text: "❌ You haven't joined all channels yet!", show_alert: true });
         }
     }
 });
 
 async function processDownload(chatId, url) {
-    const waitMsg = await bot.sendMessage(chatId, "⏳");
+    const waitMsg = await bot.sendMessage(chatId, "⏳", chatBoxConfig);
     try {
         const res = await axios.get(`https://r-gengpt-api.vercel.app/api/video/download?url=${encodeURIComponent(url)}`);
         const data = res.data.data;
         if (data && data.medias) {
             const video = data.medias.find(m => m.type === 'video') || data.medias[0];
-            await bot.sendVideo(chatId, video.url, { caption: data.title });
+            const customCaption = `${data.title}\n\nThis Video Downloaded by : @SavedMe_Robot`;
+            await bot.sendVideo(chatId, video.url, { caption: customCaption });
             await bot.deleteMessage(chatId, waitMsg.message_id);
         } else {
             bot.editMessageText("❌ Video not found.", { chat_id: chatId, message_id: waitMsg.message_id });
@@ -197,7 +221,6 @@ async function processDownload(chatId, url) {
     }
 }
 
-// অ্যাডমিন প্যানেল ফাইল সার্ভ করা (Render-এ indexadmin.html সরাসরি রুট ফোল্ডারে থাকলে)
 app.get('/admin', (req, res) => {
     res.sendFile(path.join(__dirname, 'indexadmin.html'));
 });
